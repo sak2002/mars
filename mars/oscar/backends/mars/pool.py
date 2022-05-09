@@ -17,15 +17,17 @@ import concurrent.futures as futures
 import logging.config
 import multiprocessing
 import os
+import random
 import signal
 import sys
+import uuid
 from dataclasses import dataclass
 from types import TracebackType
 from typing import List
 
 from ....utils import get_next_port, dataslots, ensure_coverage
 from ..config import ActorPoolConfig
-from ..message import CreateActorMessage
+from ..message import CreateActorMessage, reset_random_seed as reset_message_seed
 from ..pool import MainActorPoolBase, SubActorPoolBase, _register_message_handler
 
 
@@ -164,6 +166,10 @@ class MainActorPool(MainActorPoolBase):
     ):
         ensure_coverage()
 
+        # make sure enough randomness for every sub pool
+        random.seed(uuid.uuid1().bytes)
+        reset_message_seed()
+
         conf = actor_config.get_pool_config(process_index)
         suspend_sigint = conf["suspend_sigint"]
         if suspend_sigint:
@@ -233,7 +239,14 @@ class MainActorPool(MainActorPoolBase):
         await asyncio.to_thread(process.join, 5)
 
     async def is_sub_pool_alive(self, process: multiprocessing.Process):
-        return await asyncio.to_thread(process.is_alive)
+        try:
+            return await asyncio.to_thread(process.is_alive)
+        except RuntimeError as ex:  # pragma: no cover
+            if "shutdown" not in str(ex):
+                # when atexit is triggered, the default pool might be shutdown
+                # and to_thread will fail
+                raise
+            return process.is_alive()
 
     async def recover_sub_pool(self, address: str):
         process_index = self._config.get_process_index(address)

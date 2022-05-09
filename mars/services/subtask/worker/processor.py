@@ -20,13 +20,11 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Type
 
 from .... import oscar as mo
-from ....core import ChunkGraph, OperandType, enter_mode
+from ....core import ChunkGraph, OperandType, enter_mode, ExecutionError
 from ....core.context import get_context, set_context
 from ....core.operand import (
     Fetch,
     FetchShuffle,
-    MapReduceOperand,
-    VirtualOperand,
     execute,
 )
 from ....metrics import Metrics
@@ -39,6 +37,7 @@ from ...session import SessionAPI
 from ...storage import StorageAPI
 from ...task import TaskAPI, task_options
 from ..core import Subtask, SubtaskStatus, SubtaskResult
+from ..utils import iter_input_data_keys, iter_output_data, get_mapper_data_keys
 
 logger = logging.getLogger(__name__)
 
@@ -125,20 +124,13 @@ class SubtaskProcessor:
 
     async def _load_input_data(self):
         keys, gets, accept_nones = [], [], []
-        for chunk in self._chunk_graph.iter_indep():
-            if (
-                isinstance(chunk.op, Fetch)
-                and chunk.key not in self.subtask.pure_depend_keys
-            ):
-                keys.append(chunk.key)
-                gets.append(self._storage_api.get.delay(chunk.key))
-                accept_nones.append(True)
-            elif isinstance(chunk.op, FetchShuffle):
-                for key in self._chunk_key_to_data_keys[chunk.key]:
-                    if key not in keys:
-                        keys.append(key)
-                        gets.append(self._storage_api.get.delay(key, error="ignore"))
-                        accept_nones.append(False)
+        for key, is_shuffle in iter_input_data_keys(
+            self.subtask, self._chunk_graph, self._chunk_key_to_data_keys
+        ):
+            keys.append(key)
+            accept_nones.append(not is_shuffle)
+            gets_params = {"error": "ignore"} if is_shuffle else {}
+            gets.append(self._storage_api.get.delay(key, **gets_params))
         if keys:
             logger.debug(
                 "Start getting input data, keys: %s, subtask id: %s",
@@ -193,7 +185,11 @@ class SubtaskProcessor:
     def _execute_operand(
         self, ctx: Dict[str, Any], op: OperandType
     ):  # noqa: R0201  # pylint: disable=no-self-use
-        return execute(ctx, op)
+        try:
+            return execute(ctx, op)
+        except BaseException as ex:
+            # wrap exception in execution to avoid side effects
+            raise ExecutionError(ex).with_traceback(ex.__traceback__) from None
 
     async def _execute_graph(self, chunk_graph: ChunkGraph):
         loop = asyncio.get_running_loop()
@@ -283,39 +279,12 @@ class SubtaskProcessor:
             await self._storage_api.unpin.batch(*shuffle_unpins)
 
     async def _store_data(self, chunk_graph: ChunkGraph):
-        # skip virtual operands for result chunks
-        result_chunks = [
-            c for c in chunk_graph.result_chunks if not isinstance(c.op, VirtualOperand)
-        ]
-
         # store data into storage
         data_key_to_puts = {}
-        for result_chunk in result_chunks:
-            data_key = result_chunk.key
-            if data_key in self._datastore:
-                # non shuffle op
-                result_data = self._datastore[data_key]
-                # update meta
-                if not isinstance(result_data, tuple):
-                    result_chunk.params = result_chunk.get_params_from_data(result_data)
-                # check data_key after update meta
-                if data_key in data_key_to_puts:
-                    continue
-                put = self._storage_api.put.delay(data_key, result_data)
-                data_key_to_puts[data_key] = put
-            else:
-                assert isinstance(result_chunk.op, MapReduceOperand)
-                keys = [
-                    store_key
-                    for store_key in self._datastore
-                    if isinstance(store_key, tuple) and store_key[0] == data_key
-                ]
-                for key in keys:
-                    if key in data_key_to_puts:
-                        continue
-                    result_data = self._datastore[key]
-                    put = self._storage_api.put.delay(key, result_data)
-                    data_key_to_puts[key] = put
+        for key, data, _ in iter_output_data(chunk_graph, self._datastore):
+            put = self._storage_api.put.delay(key, data)
+            data_key_to_puts[key] = put
+
         stored_keys = list(data_key_to_puts.keys())
         puts = data_key_to_puts.values()
         logger.debug(
@@ -388,11 +357,7 @@ class SubtaskProcessor:
                 object_ref = data_key_to_object_id[chunk_key]
             else:
                 # mapper chunk
-                mapper_keys = [
-                    k
-                    for k in data_key_to_store_size
-                    if isinstance(k, tuple) and k[0] == chunk_key
-                ]
+                mapper_keys = get_mapper_data_keys(chunk_key, data_key_to_store_size)
                 store_size = sum(data_key_to_store_size[k] for k in mapper_keys)
                 memory_size = sum(data_key_to_memory_size[k] for k in mapper_keys)
                 object_ref = [data_key_to_object_id[k] for k in mapper_keys]
@@ -515,10 +480,14 @@ class SubtaskProcessor:
             self.result.status = SubtaskStatus.cancelled
             self.result.progress = 1.0
             raise
-        except:  # noqa: E722  # nosec  # pylint: disable=bare-except
+        except BaseException as ex:  # noqa: E722  # nosec  # pylint: disable=bare-except
             self.result.status = SubtaskStatus.errored
             self.result.progress = 1.0
-            _, self.result.error, self.result.traceback = sys.exc_info()
+            if isinstance(ex, ExecutionError):
+                self.result.error = ex.nested_error
+                self.result.traceback = ex.nested_error.__traceback__
+            else:  # pragma: no cover
+                _, self.result.error, self.result.traceback = sys.exc_info()
             await self.done()
             raise
         finally:

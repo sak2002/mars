@@ -16,10 +16,11 @@ import asyncio
 import logging
 import sys
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from ..... import oscar as mo
-from .....core import ChunkGraph, TileableGraph
+from .....core import ChunkGraph, TileContext
+from .....core.context import set_context
 from .....core.operand import (
     Fetch,
     MapReduceOperand,
@@ -30,15 +31,17 @@ from .....lib.aio import alru_cache
 from .....oscar.profiling import (
     ProfilingData,
 )
+from .....resource import Resource
 from .....typing import TileableType, BandType
 from .....utils import Timer
+from ....context import ThreadedServiceContext
 from ....cluster.api import ClusterAPI
 from ....lifecycle.api import LifecycleAPI
 from ....meta.api import MetaAPI
 from ....scheduling import SchedulingAPI
 from ....subtask import Subtask, SubtaskResult, SubtaskStatus, SubtaskGraph
 from ...core import Task
-from ..api import TaskExecutor, register_executor_cls
+from ..api import ExecutionConfig, TaskExecutor, register_executor_cls
 from .resource import ResourceEvaluator
 from .stage import TaskStageProcessor
 
@@ -59,24 +62,27 @@ def _get_n_reducer(subtask: Subtask) -> int:
 class MarsTaskExecutor(TaskExecutor):
     name = "mars"
     _stage_processors: List[TaskStageProcessor]
+    _stage_tile_progresses: List[float]
     _cur_stage_processor: Optional[TaskStageProcessor]
+    _meta_updated_tileables: Set[TileableType]
 
     def __init__(
         self,
-        config: Dict,
+        config: ExecutionConfig,
         task: Task,
-        tileable_graph: TileableGraph,
-        tile_context: Dict[TileableType, TileableType],
+        tile_context: TileContext,
         cluster_api: ClusterAPI,
         lifecycle_api: LifecycleAPI,
         scheduling_api: SchedulingAPI,
         meta_api: MetaAPI,
+        resource_evaluator: ResourceEvaluator,
     ):
         self._config = config
         self._task = task
-        self._tileable_graph = tileable_graph
+        self._tileable_graph = task.tileable_graph
         self._raw_tile_context = tile_context.copy()
         self._tile_context = tile_context
+        self._session_id = task.session_id
 
         # api
         self._cluster_api = cluster_api
@@ -85,31 +91,48 @@ class MarsTaskExecutor(TaskExecutor):
         self._meta_api = meta_api
 
         self._stage_processors = []
+        self._stage_tile_progresses = []
         self._cur_stage_processor = None
         self._lifecycle_processed_tileables = set()
         self._subtask_decref_events = dict()
+        self._meta_updated_tileables = set()
+
+        # Evaluate and initialize subtasks required resource.
+        self._resource_evaluator = resource_evaluator
 
     @classmethod
     async def create(
-        cls, config: Dict, *, session_id: str, address: str, task, **kwargs
+        cls,
+        config: ExecutionConfig,
+        *,
+        session_id: str,
+        address: str,
+        task: Task,
+        tile_context: TileContext,
+        **kwargs,
     ) -> "TaskExecutor":
-        tileable_graph = kwargs.pop("tileable_graph")
-        tile_context = kwargs.pop("tile_context")
         assert (
             len(kwargs) == 0
         ), f"Unexpected kwargs for {cls.__name__}.create: {kwargs}"
         cluster_api, lifecycle_api, scheduling_api, meta_api = await cls._get_apis(
             session_id, address
         )
+        resource_evaluator = await ResourceEvaluator.create(
+            config.get_execution_config(),
+            session_id=task.session_id,
+            task_id=task.task_id,
+            cluster_api=cluster_api,
+        )
+        await cls._init_context(session_id, address)
         return cls(
             config,
             task,
-            tileable_graph,
             tile_context,
             cluster_api,
             lifecycle_api,
             scheduling_api,
             meta_api,
+            resource_evaluator,
         )
 
     @classmethod
@@ -121,6 +144,15 @@ class MarsTaskExecutor(TaskExecutor):
             SchedulingAPI.create(session_id, address),
             MetaAPI.create(session_id, address),
         )
+
+    @classmethod
+    async def _init_context(cls, session_id: str, address: str):
+        loop = asyncio.get_running_loop()
+        context = ThreadedServiceContext(
+            session_id, address, address, address, loop=loop
+        )
+        await context.init()
+        set_context(context)
 
     async def __aenter__(self):
         profiling = ProfilingData[self._task.task_id, "general"]
@@ -134,9 +166,10 @@ class MarsTaskExecutor(TaskExecutor):
         stage_id: str,
         subtask_graph: SubtaskGraph,
         chunk_graph: ChunkGraph,
+        tile_context: TileContext,
         context=None,
     ):
-        available_bands = await self.get_available_band_slots()
+        available_bands = await self.get_available_band_resources()
         await self._incref_result_tileables()
         stage_processor = TaskStageProcessor(
             stage_id,
@@ -144,15 +177,18 @@ class MarsTaskExecutor(TaskExecutor):
             chunk_graph,
             subtask_graph,
             list(available_bands),
+            tile_context,
             self._scheduling_api,
             self._meta_api,
         )
         await self._incref_stage(stage_processor)
-        # Evaluate and initialize subtasks required resource.
-        resource_evaluator = ResourceEvaluator(stage_processor)
-        resource_evaluator.evaluate()
+        await self._resource_evaluator.evaluate(stage_processor)
         self._stage_processors.append(stage_processor)
         self._cur_stage_processor = stage_processor
+        # get the tiled progress for current stage
+        prev_progress = sum(self._stage_tile_progresses)
+        curr_tile_progress = self._tile_context.get_all_progress() - prev_progress
+        self._stage_tile_progresses.append(curr_tile_progress)
         return await stage_processor.run()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -169,18 +205,20 @@ class MarsTaskExecutor(TaskExecutor):
         if error_or_cancelled:
             # revert result incref if error or cancelled
             await self._decref_result_tileables()
+        await self._resource_evaluator.report()
 
-    async def get_available_band_slots(self) -> Dict[BandType, int]:
+    async def get_available_band_resources(self) -> Dict[BandType, Resource]:
         async for bands in self._cluster_api.watch_all_bands():
             if bands:
                 return bands
 
     async def get_progress(self) -> float:
         # get progress of stages
-        subtask_progress = 0.0
-        n_stage = 0
-
-        for stage_processor in self._stage_processors:
+        executor_progress = 0.0
+        assert len(self._stage_tile_progresses) == len(self._stage_processors)
+        for stage_processor, stage_tile_progress in zip(
+            self._stage_processors, self._stage_tile_progresses
+        ):
             if stage_processor.subtask_graph is None:  # pragma: no cover
                 # generating subtask
                 continue
@@ -195,12 +233,9 @@ class MarsTaskExecutor(TaskExecutor):
                 for subtask_key, result in stage_processor.subtask_snapshots.items()
                 if subtask_key not in stage_processor.subtask_results
             )
-            subtask_progress += progress / n_subtask
-            n_stage += 1
-        if n_stage > 0:
-            subtask_progress /= n_stage
-
-        return subtask_progress
+            subtask_progress = progress / n_subtask
+            executor_progress += subtask_progress * stage_tile_progress
+        return executor_progress
 
     async def cancel(self):
         if self._cur_stage_processor is not None:
@@ -309,7 +344,6 @@ class MarsTaskExecutor(TaskExecutor):
             if result_tileable in processed:  # pragma: no cover
                 continue
             try:
-
                 tiled_tileable = self._get_tiled(result_tileable)
                 tracks[0].append(result_tileable.key)
                 tracks[1].append(
@@ -376,9 +410,9 @@ class MarsTaskExecutor(TaskExecutor):
                     for inp_subtask in subtask_graph.predecessors(subtask):
                         for c in inp_subtask.chunk_graph.results:
                             decref_chunk_key_to_counts[c.key] += 1
-            # decref result of chunk graphs
-            for c in stage_processor.chunk_graph.results:
-                decref_chunk_key_to_counts[c.key] += 1
+        # decref result of chunk graphs
+        for c in stage_processor.chunk_graph.results:
+            decref_chunk_key_to_counts[c.key] += 1
         return decref_chunk_key_to_counts
 
     @mo.extensible

@@ -19,6 +19,7 @@ import logging
 import multiprocessing
 import os
 import threading
+import traceback
 from abc import ABC, ABCMeta, abstractmethod
 from typing import Dict, List, Type, TypeVar, Coroutine, Callable, Union, Optional
 
@@ -162,7 +163,8 @@ class AbstractActorPool(ABC):
         init_extension_entrypoints()
         # init metrics
         metric_configs = self._config.get_metric_configs()
-        init_metrics(metric_configs.get("backend"), port=metric_configs.get("port"))
+        metric_backend = metric_configs.get("backend")
+        init_metrics(metric_backend, config=metric_configs.get(metric_backend))
 
     @property
     def router(self):
@@ -361,10 +363,19 @@ class AbstractActorPool(ABC):
             with _ErrorProcessor(
                 self.external_address, result.message_id, result.protocol
             ) as processor:
-                raise SendMessageFailed(
+                error_msg = (
                     f"Error when sending message {result.message_id.hex()}. "
-                    f"Caused by {ex!r}. See server logs for more details"
-                ) from None
+                    f"Caused by {ex!r}. "
+                )
+                if isinstance(result, ErrorMessage):
+                    format_tb = "\n".join(traceback.format_tb(result.traceback))
+                    error_msg += (
+                        f"\nOriginal error: {result.error!r}"
+                        f"Traceback: \n{format_tb}"
+                    )
+                else:
+                    error_msg += "See server logs for more details"
+                raise SendMessageFailed(error_msg) from None
             await self._send_channel(processor.result, channel, resend_failure=False)
 
     async def process_message(self, message: _MessageBase, channel: Channel):
@@ -446,7 +457,9 @@ class AbstractActorPool(ABC):
     async def stop(self):
         try:
             # clean global router
-            Router.get_instance().remove_router(self._router)
+            router = Router.get_instance()
+            if router is not None:
+                router.remove_router(self._router)
             stop_tasks = []
             # stop all servers
             stop_tasks.extend([server.stop() for server in self._servers])
@@ -724,8 +737,14 @@ class SubActorPoolBase(ActorPoolBase):
     async def actor_ref(self, message: ActorRefMessage) -> ResultMessageType:
         result = await super().actor_ref(message)
         if isinstance(result, ErrorMessage):
-            message.actor_ref.address = self._main_address
-            result = await self.call(self._main_address, message)
+            # need a new message id to call main actor
+            main_message = ActorRefMessage(
+                new_message_id(),
+                create_actor_ref(self._main_address, message.actor_ref.uid),
+            )
+            result = await self.call(self._main_address, main_message)
+            # rewrite to message_id of the original request
+            result.message_id = message.message_id
         return result
 
     @implements(AbstractActorPool.destroy_actor)

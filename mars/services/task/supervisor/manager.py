@@ -21,16 +21,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Type, Union
 
 from .... import oscar as mo
-from ....core import TileableGraph, TileableType, enter_mode
-from ....core.context import set_context
+from ....core import TileableGraph, TileableType, enter_mode, TileContext
 from ....core.operand import Fetch
-from ...context import ThreadedServiceContext
 from ...subtask import SubtaskResult, SubtaskGraph
 from ..config import task_options
 from ..core import Task, new_task_id, TaskStatus
 from ..errors import TaskNotExist
 from .preprocessor import TaskPreprocessor
-from .processor import TaskProcessorActor, TaskProcessor
+from .processor import TaskProcessor
+from .task import TaskProcessorActor
 
 logger = logging.getLogger(__name__)
 
@@ -39,20 +38,20 @@ class TaskConfigurationActor(mo.Actor):
     def __init__(
         self,
         task_conf: Dict[str, Any],
-        task_executor_config: Dict[str, Any],
+        execution_config: Dict[str, Any],
         task_processor_cls: Type[TaskProcessor] = None,
         task_preprocessor_cls: Type[TaskPreprocessor] = None,
     ):
         for name, value in task_conf.items():
             setattr(task_options, name, value)
-        self._task_executor_config = task_executor_config
+        self._execution_config = execution_config
         self._task_processor_cls = task_processor_cls
         self._task_preprocessor_cls = task_preprocessor_cls
 
     def get_config(self):
         return {
             "task_options": task_options,
-            "task_executor_config": self._task_executor_config,
+            "execution_config": self._execution_config,
             "task_processor_cls": self._task_processor_cls,
             "task_preprocessor_cls": self._task_preprocessor_cls,
         }
@@ -75,7 +74,7 @@ class TaskManagerActor(mo.Actor):
         self._session_id = session_id
 
         self._config = None
-        self._task_executor_config = None
+        self._execution_config = None
         self._task_processor_cls = None
         self._task_preprocessor_cls = None
         self._last_idle_time = None
@@ -94,31 +93,20 @@ class TaskManagerActor(mo.Actor):
         task_conf = await configuration_ref.get_config()
         (
             self._config,
-            self._task_executor_config,
+            self._execution_config,
             self._task_processor_cls,
             self._task_preprocessor_cls,
         ) = (
             task_conf["task_options"],
-            task_conf["task_executor_config"],
+            task_conf["execution_config"],
             task_conf["task_processor_cls"],
             task_conf["task_preprocessor_cls"],
         )
         self._task_preprocessor_cls = self._get_task_preprocessor_cls()
 
-        # init context
-        await self._init_context()
-
     async def __pre_destroy__(self):
         for processor_ref in self._task_id_to_processor_ref.values():
             await processor_ref.destroy()
-
-    async def _init_context(self):
-        loop = asyncio.get_running_loop()
-        context = ThreadedServiceContext(
-            self._session_id, self.address, self.address, self.address, loop=loop
-        )
-        await context.init()
-        set_context(context)
 
     @staticmethod
     def gen_uid(session_id):
@@ -182,7 +170,7 @@ class TaskManagerActor(mo.Actor):
             task,
             tiled_context,
             self._config,
-            self._task_executor_config,
+            self._execution_config,
             self._task_preprocessor_cls,
         )
 
@@ -225,11 +213,9 @@ class TaskManagerActor(mo.Actor):
 
         return await processor_ref.get_tileable_subtasks(tileable_id, with_input_output)
 
-    async def _gen_tiled_context(
-        self, graph: TileableGraph
-    ) -> Dict[TileableType, TileableType]:
+    async def _gen_tiled_context(self, graph: TileableGraph) -> TileContext:
         # process graph, add fetch node to tiled context
-        tiled_context = dict()
+        tiled_context = TileContext()
         for tileable in graph:
             if isinstance(tileable.op, Fetch) and tileable.is_coarse():
                 info = self._tileable_key_to_info[tileable.key][-1]
